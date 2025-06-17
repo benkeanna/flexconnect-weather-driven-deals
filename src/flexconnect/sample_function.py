@@ -27,8 +27,9 @@ class SampleFlexConnectFunction(FlexConnectFunction):
     Name = "SampleFlexConnectFunction"
     Schema = pyarrow.schema(
         [
+            pyarrow.field("Location", pyarrow.string()),
             pyarrow.field("Date", pyarrow.timestamp("ms")),
-            pyarrow.field("Source", pyarrow.string()),
+            pyarrow.field("Wind", pyarrow.float64()),
             pyarrow.field("Temperature", pyarrow.float64()),
             pyarrow.field("Rain", pyarrow.float64()),
         ]
@@ -69,19 +70,6 @@ class SampleFlexConnectFunction(FlexConnectFunction):
         to_date = (now + timedelta(days=1)).date().isoformat()
         return from_date, to_date
 
-    def extract_location(self, execution_context: ExecutionContext) -> str:
-        location = "San Francisco"
-        for filter in getattr(execution_context, "filters", []):
-            if (
-                hasattr(filter, "label_identifier")
-                and filter.label_identifier == "customer_city"
-                and hasattr(filter, "values")
-                and filter.values
-            ):
-                location = filter.values[0]
-                break
-        return location
-
     def get_historical_data(
         self, from_date: str, to_date: str, location: str
     ) -> dict[str, Any]:
@@ -99,11 +87,11 @@ class SampleFlexConnectFunction(FlexConnectFunction):
         response = requests.get(HISTORICAL_URL, params=params)
         response.raise_for_status()
         data = response.json()
-        output = {"Date": [], "Source": [], "Temperature": [], "Rain": []}
+        output = {"Date": [], "Wind": [], "Temperature": [], "Rain": []}
         for day in data.get("forecast", {}).get("forecastday", []):
             for hour in day.get("hour", []):
                 output["Date"].append(datetime.fromtimestamp(hour["time_epoch"]))
-                output["Source"].append("Observation")
+                output["Wind"].append(hour.get("wind_kph", []))
                 output["Temperature"].append(hour["temp_c"])
                 output["Rain"].append(hour.get("chance_of_rain", 0))
         return output
@@ -120,11 +108,11 @@ class SampleFlexConnectFunction(FlexConnectFunction):
         response = requests.get(FORECAST_URL, params=params)
         response.raise_for_status()
         data = response.json()
-        output = {"Date": [], "Source": [], "Temperature": [], "Rain": []}
+        output = {"Date": [], "Wind": [], "Temperature": [], "Rain": []}
         for day in data.get("forecast", {}).get("forecastday", []):
             for hour in day.get("hour", []):
                 output["Date"].append(datetime.fromtimestamp(hour["time_epoch"]))
-                output["Source"].append("Forecast")
+                output["Wind"].append(hour.get("wind_kph", []))
                 output["Temperature"].append(hour["temp_c"])
                 output["Rain"].append(hour.get("chance_of_rain", 0))
         return output
@@ -144,16 +132,18 @@ class SampleFlexConnectFunction(FlexConnectFunction):
 
         _LOGGER.info("execution_context", execution_context=execution_context)
         from_date, to_date = self._handle_date(execution_context)
-        location = self.extract_location(execution_context)
+        location = "Berlin"
         historical_data = self.get_historical_data(from_date, to_date, location)
         forecast_data = self.get_forecast_data(from_date, to_date, location)
         output = {
             "Date": historical_data["Date"] + forecast_data["Date"],
-            "Source": historical_data["Source"] + forecast_data["Source"],
+            "Wind": historical_data["Wind"] + forecast_data["Wind"],
             "Temperature": historical_data["Temperature"]
             + forecast_data["Temperature"],
             "Rain": historical_data["Rain"] + forecast_data["Rain"],
         }
+        row_count = len(output["Date"])
+        output["Location"] = [location] * row_count
         return pyarrow.Table.from_pydict(output)
 
     @staticmethod
