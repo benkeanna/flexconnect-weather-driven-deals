@@ -1,90 +1,133 @@
-# (C) 2024 GoodData Corporation
-import uuid
-from typing import Optional
+# (C) 2025 GoodData Corporation
+from datetime import datetime, timedelta
+from typing import Any, Optional
 
 import gooddata_flight_server as gf
 import pyarrow
+import requests
 import structlog
 from gooddata_flexconnect import (
-    DataSourceMessage,
     ExecutionContext,
-    ExecutionType,
     FlexConnectFunction,
-    add_data_source_messages_metadata,
 )
+from gooddata_sdk import AbsoluteDateFilter, RelativeDateFilter
 
 _LOGGER = structlog.get_logger("sample_flexconnect_function")
 
 
+HISTORICAL_URL = "https://api.weatherapi.com/v1/history.json"
+FORECAST_URL = "https://api.weatherapi.com/v1/forecast.json"
+
+
 class SampleFlexConnectFunction(FlexConnectFunction):
     """
-    A sample FlexConnect function. This serves static data. It is not very useful but is
-    a good starting point to explain FlexConnect functions:
-
-    - Specify a nice name in `Name` field -> this will be visible in GoodData's
-      semantic model
-    - Specify `Schema` which describes the result -> this information will be used
-      to populate data set columns in GoodData's Semantic Model
-
-    The `call` method does the heavy lifting. This is where you add your custom code to generate the result.
-    Typically, the `call` method should inspect the parameters and do the computation as necessary.
-
-    NOTE: when GoodData invokes your function, it may provide a hint on which
-    columns it is interested in - it will always be a subset of all columns defined in
-    the `Schema`.
-
-    Your code MAY take this into account and return only those desired columns. This is
-    a basic optimization that your function can leverage to save bandwidth. The presence of
-    `columns` does not mean your function should perform additional aggregations or alter
-    how it does the computation - it only tells your code that you can trim some columns
-    from the result.
-
-    If you want to learn more, check out the class documentation on the `FlexConnectFunction` class.
+    A sample FlexConnect function. This serves weather data from weatherapi.com.
     """
 
     Name = "SampleFlexConnectFunction"
     Schema = pyarrow.schema(
         [
-            pyarrow.field("attribute1", pyarrow.string()),
-            pyarrow.field("attribute2", pyarrow.string()),
-            pyarrow.field("attribute3", pyarrow.bool_()),
-            pyarrow.field("fact1", pyarrow.float64()),
-            pyarrow.field("fact2", pyarrow.float64()),
-            pyarrow.field("fact3", pyarrow.int64()),
+            pyarrow.field("Date", pyarrow.timestamp("ms")),
+            pyarrow.field("Source", pyarrow.string()),
+            pyarrow.field("Temperature", pyarrow.float64()),
+            pyarrow.field("Rain", pyarrow.float64()),
         ]
     )
+    api_key = "0102b58ffeda496395e125251251706"
 
-    _StaticData = pyarrow.table(
-        {
-            "attribute1": ["id1", "id2", "id3", "id4", "id5", "id6"],
-            "attribute2": ["value1", "value2", "value3", "value1", "value2", "value3"],
-            "attribute3": [True, True, True, False, False, False],
-            "fact1": [123.456, 23.45, 8.76, 1.23, 34.56, 567.89],
-            "fact2": [0.1, 0.2, 0.3, 0.15, 0.25, 0.35],
-            "fact3": [111, 222, 333, 444, 555, 666],
-        },
-        # This is how you can pas additional data to GoodData.
-        # These will then be available in the execution result metadata.
-        # If you are not planning to use this feature, feel free to omit this altogether.
-        # See https://github.com/gooddata/gooddata-python-sdk/blob/master/gooddata-flexconnect/gooddata_flexconnect/function/data_source_messages.py
-        # for additional helper functions to add the DataSourceMessages in case you are using Arrow's RecordBatchReaders.
-        metadata=add_data_source_messages_metadata(
-            [
-                DataSourceMessage(
-                    # Unique identifier of the call, this allows you to discern different messages from the same source.
-                    correlation_id=str(uuid.uuid4()),
-                    # Name of the message source.
-                    source=Name,
-                    # Type of the message. There are currently no well-known types, but we may add some in the future.
-                    type="info",
-                    # You can include arbitrary data; however, there are two important limitations:
-                    # 1. The data MUST be serializable to JSON.
-                    # 2. The data SHOULD be small, there are quite strict limits on the size of the metadata.
-                    data={"extra": "data"},
-                )
-            ]
-        ),
-    )
+    def _handle_date(self, context: Optional[ExecutionContext]) -> tuple[str, str]:
+        now = datetime.now()
+        for date_filter in getattr(context, "filters", []):
+            if isinstance(date_filter, AbsoluteDateFilter):
+                return date_filter.from_date, date_filter.to_date
+            elif isinstance(date_filter, RelativeDateFilter):
+                if date_filter.granularity == "DAY":
+                    from_date = (
+                        now + timedelta(days=date_filter.from_shift - 1)
+                    ).date()
+                    to_date = (now + timedelta(days=date_filter.to_shift)).date()
+                    if date_filter.to_shift == 0:
+                        to_date = now.date()
+                elif date_filter.granularity == "WEEK":
+                    current_week_start = now - timedelta(days=now.weekday())
+                    from_date = current_week_start + timedelta(
+                        weeks=date_filter.from_shift
+                    )
+                    to_date = (
+                        current_week_start
+                        + timedelta(weeks=date_filter.to_shift + 1)
+                        - timedelta(seconds=1)
+                    )
+                    if date_filter.to_shift == 0:
+                        to_date = current_week_start + timedelta(
+                            days=6, hours=23, minutes=59, seconds=59
+                        )
+                else:
+                    continue
+                return from_date.isoformat(), to_date.isoformat()
+        from_date = (now - timedelta(days=7)).date().isoformat()
+        to_date = (now + timedelta(days=1)).date().isoformat()
+        return from_date, to_date
+
+    def extract_location(self, execution_context: ExecutionContext) -> str:
+        location = "San Francisco"
+        for filter in getattr(execution_context, "filters", []):
+            if (
+                hasattr(filter, "label_identifier")
+                and filter.label_identifier == "customer_city"
+                and hasattr(filter, "values")
+                and filter.values
+            ):
+                location = filter.values[0]
+                break
+        return location
+
+    def get_historical_data(
+        self, from_date: str, to_date: str, location: str
+    ) -> dict[str, Any]:
+        now_date = datetime.now().date()
+        to_date_obj = datetime.fromisoformat(to_date)
+        if isinstance(to_date_obj, datetime):
+            to_date_obj = to_date_obj.date()
+        clamped_end_date = min(now_date, to_date_obj).isoformat()
+        params = {
+            "key": self.api_key,
+            "q": location,
+            "dt": from_date,
+            "end_dt": clamped_end_date,
+        }
+        response = requests.get(HISTORICAL_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+        output = {"Date": [], "Source": [], "Temperature": [], "Rain": []}
+        for day in data.get("forecast", {}).get("forecastday", []):
+            for hour in day.get("hour", []):
+                output["Date"].append(datetime.fromtimestamp(hour["time_epoch"]))
+                output["Source"].append("Observation")
+                output["Temperature"].append(hour["temp_c"])
+                output["Rain"].append(hour.get("chance_of_rain", 0))
+        return output
+
+    def get_forecast_data(
+        self, from_date: str, to_date: str, location: str
+    ) -> dict[str, Any]:
+        params = {
+            "key": self.api_key,
+            "q": location,
+            "dt": from_date,
+            "end_dt": to_date,
+        }
+        response = requests.get(FORECAST_URL, params=params)
+        response.raise_for_status()
+        data = response.json()
+        output = {"Date": [], "Source": [], "Temperature": [], "Rain": []}
+        for day in data.get("forecast", {}).get("forecastday", []):
+            for hour in day.get("hour", []):
+                output["Date"].append(datetime.fromtimestamp(hour["time_epoch"]))
+                output["Source"].append("Forecast")
+                output["Temperature"].append(hour["temp_c"])
+                output["Rain"].append(hour.get("chance_of_rain", 0))
+        return output
 
     def call(
         self,
@@ -100,21 +143,18 @@ class SampleFlexConnectFunction(FlexConnectFunction):
             raise ValueError("Function did not receive execution context.")
 
         _LOGGER.info("execution_context", execution_context=execution_context)
-
-        if execution_context.execution_type == ExecutionType.REPORT:
-            _LOGGER.info(
-                "report_execution",
-                report_execution_context=execution_context.report_execution_request,
-            )
-        elif execution_context.execution_type == ExecutionType.LABEL_ELEMENTS:
-            _LOGGER.info(
-                "label_elements",
-                label_elements_execution_context=execution_context.label_elements_execution_request,
-            )
-        else:
-            _LOGGER.info("Received unknown execution request")
-
-        return self._StaticData
+        from_date, to_date = self._handle_date(execution_context)
+        location = self.extract_location(execution_context)
+        historical_data = self.get_historical_data(from_date, to_date, location)
+        forecast_data = self.get_forecast_data(from_date, to_date, location)
+        output = {
+            "Date": historical_data["Date"] + forecast_data["Date"],
+            "Source": historical_data["Source"] + forecast_data["Source"],
+            "Temperature": historical_data["Temperature"]
+            + forecast_data["Temperature"],
+            "Rain": historical_data["Rain"] + forecast_data["Rain"],
+        }
+        return pyarrow.Table.from_pydict(output)
 
     @staticmethod
     def on_load(ctx: gf.ServerContext) -> None:
