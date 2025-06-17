@@ -30,7 +30,8 @@ class SampleFlexConnectFunction(FlexConnectFunction):
             pyarrow.field("Location", pyarrow.string()),
             pyarrow.field("Date", pyarrow.timestamp("ms")),
             pyarrow.field("Wind", pyarrow.float64()),
-            pyarrow.field("Temperature", pyarrow.float64()),
+            pyarrow.field("TemperatureMin", pyarrow.float64()),
+            pyarrow.field("TemperatureMax", pyarrow.float64()),
             pyarrow.field("Rain", pyarrow.float64()),
         ]
     )
@@ -73,27 +74,34 @@ class SampleFlexConnectFunction(FlexConnectFunction):
     def get_historical_data(
         self, from_date: str, to_date: str, location: str
     ) -> dict[str, Any]:
-        now_date = datetime.now().date()
-        to_date_obj = datetime.fromisoformat(to_date)
-        if isinstance(to_date_obj, datetime):
-            to_date_obj = to_date_obj.date()
-        clamped_end_date = min(now_date, to_date_obj).isoformat()
-        params = {
-            "key": self.api_key,
-            "q": location,
-            "dt": from_date,
-            "end_dt": clamped_end_date,
+        # WeatherAPI /history.json only supports one day per request, so we must loop
+        from_dt = datetime.fromisoformat(from_date)
+        to_dt = datetime.fromisoformat(to_date)
+        output = {
+            "Date": [],
+            "Wind": [],
+            "TemperatureMin": [],
+            "TemperatureMax": [],
+            "Rain": [],
         }
-        response = requests.get(HISTORICAL_URL, params=params)
-        response.raise_for_status()
-        data = response.json()
-        output = {"Date": [], "Wind": [], "Temperature": [], "Rain": []}
-        for day in data.get("forecast", {}).get("forecastday", []):
-            for hour in day.get("hour", []):
-                output["Date"].append(datetime.fromtimestamp(hour["time_epoch"]))
-                output["Wind"].append(hour.get("wind_kph", []))
-                output["Temperature"].append(hour["temp_c"])
-                output["Rain"].append(hour.get("chance_of_rain", 0))
+        for n in range((to_dt - from_dt).days + 1):
+            day = from_dt + timedelta(days=n)
+            params = {
+                "key": self.api_key,
+                "q": location,
+                "dt": day.date().isoformat(),
+            }
+            response = requests.get(HISTORICAL_URL, params=params)
+            response.raise_for_status()
+            data = response.json()
+            for d in data.get("forecast", {}).get("forecastday", []):
+                date = datetime.fromtimestamp(d["date_epoch"])
+                day_data = d.get("day", {})
+                output["Date"].append(date)
+                output["Wind"].append(day_data.get("maxwind_kph", None))
+                output["TemperatureMin"].append(day_data.get("mintemp_c", None))
+                output["TemperatureMax"].append(day_data.get("maxtemp_c", None))
+                output["Rain"].append(day_data.get("totalprecip_mm", 0))
         return output
 
     def get_forecast_data(
@@ -102,19 +110,26 @@ class SampleFlexConnectFunction(FlexConnectFunction):
         params = {
             "key": self.api_key,
             "q": location,
-            "dt": from_date,
-            "end_dt": to_date,
+            "days": 3,  # WeatherAPI free plan allows up to 3 days
         }
         response = requests.get(FORECAST_URL, params=params)
         response.raise_for_status()
         data = response.json()
-        output = {"Date": [], "Wind": [], "Temperature": [], "Rain": []}
+        output = {
+            "Date": [],
+            "Wind": [],
+            "TemperatureMin": [],
+            "TemperatureMax": [],
+            "Rain": [],
+        }
         for day in data.get("forecast", {}).get("forecastday", []):
-            for hour in day.get("hour", []):
-                output["Date"].append(datetime.fromtimestamp(hour["time_epoch"]))
-                output["Wind"].append(hour.get("wind_kph", []))
-                output["Temperature"].append(hour["temp_c"])
-                output["Rain"].append(hour.get("chance_of_rain", 0))
+            date = datetime.fromtimestamp(day["date_epoch"])
+            day_data = day.get("day", {})
+            output["Date"].append(date)
+            output["Wind"].append(day_data.get("maxwind_kph", None))
+            output["TemperatureMin"].append(day_data.get("mintemp_c", None))
+            output["TemperatureMax"].append(day_data.get("maxtemp_c", None))
+            output["Rain"].append(day_data.get("totalprecip_mm", 0))
         return output
 
     def call(
@@ -138,8 +153,10 @@ class SampleFlexConnectFunction(FlexConnectFunction):
         output = {
             "Date": historical_data["Date"] + forecast_data["Date"],
             "Wind": historical_data["Wind"] + forecast_data["Wind"],
-            "Temperature": historical_data["Temperature"]
-            + forecast_data["Temperature"],
+            "TemperatureMin": historical_data["TemperatureMin"]
+            + forecast_data["TemperatureMin"],
+            "TemperatureMax": historical_data["TemperatureMax"]
+            + forecast_data["TemperatureMax"],
             "Rain": historical_data["Rain"] + forecast_data["Rain"],
         }
         row_count = len(output["Date"])
