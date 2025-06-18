@@ -5,7 +5,8 @@
 # specify one or more modules that contain FlexConnection function implementations
 #
 functions = [
-    "flexconnect.sample_function"
+    "flexconnect.sample_function",
+    "flexconnect.data",
 ]
 
 # When FlexConnect invokes a function in response to GetFlightInfo call from the
